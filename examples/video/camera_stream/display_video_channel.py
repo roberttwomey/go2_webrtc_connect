@@ -47,12 +47,19 @@ TOLERANCE = 50  # Acceptable pixel range for centering
 target_object = "none" # Default = no tracking
 centering_enabled = False # enable/disable centering
 
+frame_buffer = None  # Global variable to hold the latest frame
+buffer_lock = threading.Lock()
+
 # Processing video frames
 async def recv_camera_stream(track):
+    global frame_buffer
     while True:
         frame = await track.recv()
         img = frame.to_ndarray(format="bgr24")
-        frame_queue.put(img)
+
+        # Store the latest frame and discard older ones
+        with buffer_lock:
+            frame_buffer = img
 
 # Rotate Laika based on target object's position
 async def adjust_rotation(conn, obj_x):
@@ -115,42 +122,63 @@ async def main():
     # Start user input thread
     threading.Thread(target=handle_user_commands, daemon=True).start()
 
+    last_detection_time = time.time()
+    searching = False
+
     while True:
-        if not frame_queue.empty():
-            img = frame_queue.get()
+        with buffer_lock:
+            img = frame_buffer
 
-            if img is None:
-                continue
+        if img is None:
+            await asyncio.sleep(0.01)
+            continue
 
-            # Run YOLO object detection without verbose logging
-            results = model(img, verbose=False)
+        detected_target = False
 
-            detected_target = False
+        # Run YOLO object detection without verbose logging
+        results = model(img, verbose=False)
 
-            for result in results:
-                for box in result.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    obj_x = (x1 + x2) // 2
-                    confidence = float(box.conf[0])
-                    obj_class = int(box.cls[0])
-                    label = result.names[obj_class]
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                obj_x = (x1 + x2) // 2
+                confidence = float(box.conf[0])
+                obj_class = int(box.cls[0])
+                label = result.names[obj_class]
 
-                    # Draw bounding box and label
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(img, f"{label} {confidence:.2f}", (x1, y1 - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Draw bounding box and label
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img, f"{label} {confidence:.2f}", (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-                    # Check if detected object matches the target
-                    if label.lower() == target_object.lower():
-                        detected_target = True
-                        await adjust_rotation(conn, obj_x)
+                # Check if detected object matches the target
+                if label.lower() == target_object.lower():
+                    detected_target = True
+                    await adjust_rotation(conn, obj_x)
 
-            # Display the frame
-            cv2.imshow("YOLO Object Tracking", img)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+        # If target object is NOT detected
+        if not detected_target:
+            elapsed_time = time.time() - last_detection_time
 
-        await asyncio.sleep(0.1)  # Prevent high CPU usage
+            if elapsed_time > 10 and not searching:
+                searching = True
+                print(f"🔄 Target '{target_object}' not found for 10 seconds! Rotating left...")
+
+                # Rotate left for 10 seconds
+                start_time = time.time()
+                while time.time() - start_time < 10:
+                    await turn_left_min(conn)
+                    await asyncio.sleep(0.1)
+
+                print("✅ Search complete. Resuming detection...")
+                last_detection_time = time.time()
+
+        # Display the frame
+        cv2.imshow("YOLO Object Tracking", img)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+        await asyncio.sleep(0.1)
 
 
 if __name__ == "__main__":
