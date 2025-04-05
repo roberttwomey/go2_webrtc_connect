@@ -2,188 +2,191 @@ import cv2
 import numpy as np
 import sys
 import os
-
-# Create an OpenCV window and display a blank image
-height, width = 720, 1280  # Adjust the size as needed
-img = np.zeros((height, width, 3), dtype=np.uint8)
-cv2.imshow('Video', img)
-cv2.waitKey(1)  # Ensure the window is created
-
-# Get the absolute path of the 'examples' directory
-script_dir = os.path.dirname(os.path.abspath(__file__))
-examples_dir = os.path.abspath(os.path.join(script_dir, "..", ".."))
-
-# Add 'examples' to Python's search path
-sys.path.append(examples_dir)
-
 import asyncio
 import logging
 import threading
 import time
-from queue import Queue
 from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectionMethod
 from aiortc import MediaStreamTrack
 from ultralytics import YOLO
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
-from data_channel.main.commands import turn_left, turn_left_small, turn_left_min, turn_right, turn_right_small, turn_right_min
+from data_channel.main.commands import (
+    turn_left, turn_left_small, turn_left_min,
+    turn_right, turn_right_small, turn_right_min
+)
 
-
-# Enable logging for debugging
 logging.basicConfig(level=logging.FATAL)
 
-# Initialize YOLO
 model = YOLO("yolov8n.pt")
 
-# Frame queue for WebRTC video
-frame_queue = Queue()
-
-# Define image dimensions
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 720
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 360
 CENTER_X = FRAME_WIDTH // 2
-CENTER_Y = FRAME_HEIGHT // 2
-TOLERANCE = 50  # Acceptable pixel range for centering
+TOLERANCE = 40
 
-target_object = "none" # Default = no tracking
-centering_enabled = False # enable/disable centering
+latest_frame = None
+frame_lock = threading.Lock()
+latest_frame_timestamp = 0
 
-frame_buffer = None  # Global variable to hold the latest frame
-buffer_lock = threading.Lock()
 
-# Processing video frames
-async def recv_camera_stream(track):
-    global frame_buffer
-    while True:
-        frame = await track.recv()
-        img = frame.to_ndarray(format="bgr24")
+target_object = "person"
+centering_enabled = False
+object_detected_once = False
+search_start_time = None
 
-        # Store the latest frame and discard older ones
-        with buffer_lock:
-            frame_buffer = img
+missing_frame_count = 0
+MAX_MISSING_FRAMES = 30  # If no frame for ~1s, reconnect
 
-# Rotate Laika based on target object's position
-async def adjust_rotation(conn, obj_x):
-    """Rotates the robot based on target object's position."""
-    global target_object, centering_enabled
-
-    if not centering_enabled:
-        return  # Do nothing if centering is disabled
-    
-    x_offset = obj_x - CENTER_X
-
-    if abs(x_offset) > TOLERANCE:
-        if x_offset < 0:
-            print(f"{target_object} is to the left → Rotating left")
-            await turn_left_min(conn)
-        else:
-            print(f"{target_object} is to the right → Rotating right")
-            await turn_right_min(conn)
-    else:
-        print(f"{target_object} is centered! No rotation needed.")
-
-def handle_user_commands():
-    """Listens for user commands to change the target object or enable/disable centering."""
-    global target_object, centering_enabled
+def detection_loop():
+    global latest_frame, object_detected_once, search_start_time, latest_frame_timestamp
+    last_detection_time = 0
+    DETECTION_INTERVAL = 0.5  # seconds
 
     while True:
-        command = input("\nEnter command (target object / 'center' / 'stop' / 'q' to quit): ").strip().lower()
+        with frame_lock:
+            if latest_frame is None:
+                time.sleep(0.01)
+                continue
+            frame = latest_frame.copy()
+            frame_time = latest_frame_timestamp
+            latest_frame = None
 
-        if command == "q":
-            print("🚀 Exiting program...")
-            os._exit(0)
+        now = time.time()
+        print(f"[DETECT] Frame delay: {now - frame_time:.2f}s")
 
-        elif command == "center":
-            centering_enabled = True
-            print("✅ Centering enabled!")
-
-        elif command == "stop":
-            centering_enabled = False
-            print("⏹️ Centering disabled!")
-
-        else:
-            target_object = command  # Update target object
-            print(f"🎯 Target object updated to: {target_object}")
-
-
-async def main():
-
-    # Choose a connection method (uncomment the correct one)
-    # conn = Go2WebRTCConnection(WebRTCConnectionMethod.LocalSTA, ip="192.168.8.181")
-    # conn = Go2WebRTCConnection(WebRTCConnectionMethod.LocalSTA, serialNumber="B42D2000XXXXXXXX")
-    # conn = Go2WebRTCConnection(WebRTCConnectionMethod.Remote, serialNumber="B42D2000XXXXXXXX", username="email@gmail.com", password="pass")
-    conn = Go2WebRTCConnection(WebRTCConnectionMethod.LocalAP)
-
-    await conn.connect()
-
-    # Start video stream
-    conn.video.switchVideoChannel(True)
-    conn.video.add_track_callback(recv_camera_stream)
-
-    # Start user input thread
-    threading.Thread(target=handle_user_commands, daemon=True).start()
-
-    last_detection_time = time.time()
-    searching = False
-
-    while True:
-        with buffer_lock:
-            img = frame_buffer
-
-        if img is None:
-            await asyncio.sleep(0.01)
+        if not centering_enabled:
             continue
 
-        detected_target = False
+        if now - last_detection_time < DETECTION_INTERVAL:
+            continue
 
-        # Run YOLO object detection without verbose logging
-        results = model(img, verbose=False)
+        last_detection_time = now
+        detected = False
 
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                obj_x = (x1 + x2) // 2
-                confidence = float(box.conf[0])
-                obj_class = int(box.cls[0])
-                label = result.names[obj_class]
+        try:
+            infer_start = time.time()
+            results = model(frame, verbose=False)
+            infer_end = time.time()
+            print(f"[YOLO] Inference time: {infer_end - infer_start:.2f}s")
+        except Exception as e:
+            print(f"[YOLO ERROR] {e}")
+            continue
 
-                # Draw bounding box and label
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(img, f"{label} {confidence:.2f}", (x1, y1 - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        if results:
+            for r in results:
+                for box in r.boxes:
+                    cls = int(box.cls[0])
+                    label = model.names[cls]
+                    if label == target_object:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        center_x = (x1 + x2) // 2
+                        offset = center_x - CENTER_X
 
-                # Check if detected object matches the target
-                if label.lower() == target_object.lower():
-                    detected_target = True
-                    await adjust_rotation(conn, obj_x)
+                        if abs(offset) > TOLERANCE:
+                            if offset > 0:
+                                turn_right_min()
+                            else:
+                                turn_left_min()
+                        detected = True
+                        object_detected_once = True
+                        break
 
-        # If target object is NOT detected
-        if not detected_target:
-            elapsed_time = time.time() - last_detection_time
+        if not detected and not object_detected_once:
+            if search_start_time is None:
+                search_start_time = time.time()
+                print("[INFO] Waiting 10 seconds before rotating...")
+            elif time.time() - search_start_time >= 10:
+                print("[INFO] Target not detected after 10 seconds, rotating...")
+                turn_left_min()
 
-            if elapsed_time > 10 and not searching:
-                searching = True
-                print(f"🔄 Target '{target_object}' not found for 10 seconds! Rotating left...")
 
-                # Rotate left for 10 seconds
-                start_time = time.time()
-                while time.time() - start_time < 10:
-                    await turn_left_min(conn)
-                    await asyncio.sleep(0.1)
+def command_loop():
+    global target_object, centering_enabled, object_detected_once, search_start_time
+    print("Command Interface Ready. Type 'help' for options.")
+    while True:
+        cmd = input("[Command]> ").strip().lower()
+        if cmd.startswith("set "):
+            target_object = cmd[4:].strip()
+            object_detected_once = False
+            search_start_time = None
+            print(f"[INFO] Target object set to '{target_object}'")
+        elif cmd == "start":
+            centering_enabled = True
+            object_detected_once = False
+            search_start_time = None
+            print("[INFO] Object search started.")
+        elif cmd == "stop":
+            centering_enabled = False
+            print("[INFO] Object search stopped.")
+        elif cmd == "help":
+            print("\nCommands:")
+            print("  set <object>  - Change target object (e.g., set bottle)")
+            print("  start         - Start object detection and centering")
+            print("  stop          - Stop object detection")
+            print("  help          - Show this help message\n")
+        else:
+            print("[ERROR] Unknown command. Type 'help' for available commands.")
 
-                print("✅ Search complete. Resuming detection...")
-                last_detection_time = time.time()
 
-        # Display the frame
-        cv2.imshow("YOLO Object Tracking", img)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+class VideoStreamTrack(MediaStreamTrack):
+    kind = "video"
 
-        await asyncio.sleep(0.1)
+    async def recv(self):
+        global latest_frame, latest_frame_timestamp, missing_frame_count
+        recv_time = time.time()
+        print(f"[RECV] Frame received at {recv_time:.2f}")
+
+        try:
+            frame = await super().recv()
+        except Exception as e:
+            print(f"[RECV ERROR] {e} — trying to request keyframe...")
+            try:
+                await self._track._sender._transport._connection.request_keyframe()
+                print("[INFO] Keyframe requested")
+            except Exception as ex:
+                print(f"[ERROR] Failed to request keyframe: {ex}")
+            missing_frame_count += 1
+            return None
+
+        img = frame.to_ndarray(format="bgr24")
+        resized = cv2.resize(img, (FRAME_WIDTH, FRAME_HEIGHT))
+
+        with frame_lock:
+            latest_frame = resized
+            latest_frame_timestamp = recv_time
+
+        missing_frame_count = 0
+        await asyncio.sleep(0.03)
+        return frame
+
+
+def start_webrtc():
+    global missing_frame_count
+    connection = Go2WebRTCConnection(
+        rtc_topic=RTC_TOPIC,
+        method=WebRTCConnectionMethod.AUTO,
+        video_transform=VideoStreamTrack
+    )
+
+    async def connect_loop():
+        while True:
+            await connection.connect()
+            print("Go2 connection mode:", connection.connectionMethod.name)
+            while connection.isConnected:
+                await asyncio.sleep(1)
+                if missing_frame_count > MAX_MISSING_FRAMES:
+                    print("[WARN] No frames received. Reconnecting...")
+                    await connection.reconnect()
+                    missing_frame_count = 0
+
+    asyncio.run(connect_loop())
+
+
+def main():
+    threading.Thread(target=detection_loop, daemon=True).start()
+    threading.Thread(target=command_loop, daemon=True).start()
+    start_webrtc()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nProgram interrupted by user.")
-        sys.exit(0)
+    main()

@@ -170,6 +170,16 @@ class Go2WebRTCConnection:
 
         logging.info("Creating offer...")
         offer = await self.pc.createOffer()
+
+        for transceiver in self.pc.getTransceivers():
+            if transceiver.kind == "video":
+                from aiortc.codecs import get_capabilities
+                capabilities = get_capabilities("video")
+                for codec in capabilities.codecs:
+                    if codec.mimeType.lower() == "video/vp8":
+                        transceiver.setCodecPreferences([codec])
+                        print("[INFO] VP8 codec forced for video stream")
+                        
         await self.pc.setLocalDescription(offer)
 
         if self.connectionMethod == WebRTCConnectionMethod.Remote:
