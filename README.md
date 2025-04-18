@@ -17,7 +17,7 @@
 - Go2 will fail to locate or rotate to an object if it moves too fast.
 1. Go to `camera_stream` directory.
 2. Enter `python display_video_channel.py`  in terminal to initiate video streaming and object detection.
-3. Enter one of these desired commands.
+3. Enter one of these desired commands in terminal.
 - `target <OBJECT NAME>` – replace "OBJECT NAME" with a class to center on
 - `start` / `stop` – begin or pause auto‑centering
 - `quit` – cleanly exit
