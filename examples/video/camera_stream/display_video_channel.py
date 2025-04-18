@@ -120,7 +120,7 @@ def main():
                         else:
                             turn = commands.turn_left_min
 
-                        # throttle to one turn every 2 seconds
+                        # throttle to one turn every 1 second
                         now = time.time()
                         if now - last_turn_time >= 1.0:
                             asyncio.run_coroutine_threadsafe(turn(conn), loop)
