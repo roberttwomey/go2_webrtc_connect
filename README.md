@@ -1,3 +1,31 @@
+# Commands
+## Movement Commands
+- I programmed Laika to make specific movements based on the command it receives.
+1. Go to the directory where `main` folder is located.
+2. Enter `python main.py "COMMAND"` .
+    - Replace COMMAND with the user’s desired command. (`move front`, `move back`, `move left`, `move left small`, `move left minimum`, `move right`, `move right small`, `move left minimum`)
+    - Make sure to include the double quotation marks.
+
+## Speech Recognition Commands (incomplete)
+- I used Speech Recognition library to implement the speech recognition feature.
+- This feature doesn’t work without internet connection, as it uses Google Cloud Speech API.
+1.  Go to the directory where `main` folder is located.
+2. Enter `python main.py` . Laika will automatically switch to speech recognition mode.
+3. Speak the user’s desired command. (`move front`, `move back`, `move left`, `move left small`, `move left minimum`, `move right`, `move right small`, `move left minimum`)
+
+## Object Detection & Rotation Commands
+- Go2 will fail to locate or rotate to an object if it moves too fast.
+1. Go to `camera_stream` directory.
+2. Enter `python display_video_channel.py`  in terminal to initiate video streaming and object detection.
+3. Enter one of these desired commands.
+- `target <object_name>` – pick which class to center on
+- `start` / `stop` – begin or pause auto‑centering
+- `quit` – cleanly exit
+
+
+--------------------
+
+
 # Full Unitree Go2 WebRTC Driver
 
 This repository contains a Python implementation of the WebRTC driver to connect to the Unitree Go2 Robot. WebRTC is used by the Unitree Go APP and provides high-level control through it. Therefore, no jailbreak or firmware manipulation is required. It works out of the box for Go2 AIR/PRO/EDU models.
