@@ -9,7 +9,6 @@ import time
 from queue import Queue
 
 file_dir = os.path.dirname(os.path.abspath(__file__))
-
 cmd_folder = os.path.normpath(
     os.path.join(file_dir, '..', '..', 'data_channel', 'main')
 )
@@ -18,6 +17,7 @@ import commands
 
 from ultralytics import YOLO
 from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectionMethod
+from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
 from aiortc import MediaStreamTrack
 
 logging.basicConfig(level=logging.FATAL)
@@ -25,11 +25,29 @@ logging.basicConfig(level=logging.FATAL)
 # Load YOLOv8 (will download weights if missing)
 model = YOLO('yolov8n.pt')
 
+# --- movement functions ---
+async def move_forward(conn):
+    print("Moving forward...")
+    await conn.datachannel.pub_sub.publish_request_new(
+        RTC_TOPIC["SPORT_MOD"],
+        {
+            "api_id": SPORT_CMD["Move"],
+            "parameter": {"x": 1, "y": 0, "z": 0}
+        }
+    )
+
+# … (other moves left, right, turn_left_min, turn_right_min, etc.) …
+
 def main():
     frame_queue = Queue()
-    target = None
-    centering = False
-    running = True
+    target     = None
+    centering  = False
+    approaching = False 
+    running    = True
+
+    # throttle timers
+    last_turn_time    = 0.0
+    last_forward_time = 0.0 
 
     # 1) Set up WebRTC connection & asyncio loop in a separate thread
     conn = Go2WebRTCConnection(WebRTCConnectionMethod.LocalAP)
@@ -52,9 +70,9 @@ def main():
 
     threading.Thread(target=rtc_thread, args=(loop,), daemon=True).start()
 
-    # 2) Spawn a console‑input thread to handle user commands
+    # 2) Console‑input thread (extended for "approach")
     def input_thread():
-        nonlocal target, centering, running
+        nonlocal target, centering, approaching, running
         while running:
             cmd = input('> ').strip().lower()
             if cmd.startswith('target '):
@@ -67,9 +85,14 @@ def main():
                     print("[INFO] Auto‑centering ON")
                 else:
                     print("[WARN] You must set a target first: target <object_name>")
+            elif cmd == 'approach':          # ← new command
+                approaching = not approaching
+                state = "ON" if approaching else "OFF"
+                print(f"[INFO] Auto‑approach {state}")
             elif cmd == 'stop':
                 centering = False
-                print("[INFO] Auto‑centering OFF")
+                approaching = False        # ← also turn off approach
+                print("[INFO] Auto‑centering & Auto‑approach OFF")
             elif cmd == 'quit':
                 running = False
                 print("[INFO] Quitting...")
@@ -78,61 +101,61 @@ def main():
 
     threading.Thread(target=input_thread, daemon=True).start()
 
-    # 3) Main display + centering loop (with 2 s delay between turns)
+    # 3) Main display + detection loop
     win_name = 'Object Detection'
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 
-    # keep track of when we last sent a turn
-    last_turn_time = 0.0
-
     while running:
-        if not frame_queue.empty():
-            frame = frame_queue.get()
-
-            # run detection and annotate
-            results = model(frame, verbose=False)[0]
-            annotated = results.plot()
-
-            if centering and target:
-                names = results.names
-                boxes = results.boxes
-                candidates = []
-
-                for box, cls_id in zip(boxes.xyxy, boxes.cls):
-                    name = names[int(cls_id)].lower().replace(' ', '')
-                    if name == target:
-                        x1, y1, x2, y2 = box
-                        area = float((x2 - x1) * (y2 - y1))
-                        cx = float((x1 + x2) / 2)
-                        candidates.append((area, cx))
-
-                if candidates:
-                    # select the largest detection
-                    _, cx = max(candidates, key=lambda x: x[0])
-                    img_h, img_w = frame.shape[:2]
-                    dx = cx - img_w / 2
-
-                    tol = 0.05 * img_w  # dead‑zone tolerance
-                    if abs(dx) > tol:
-                        # choose turn command
-                        if dx > 0:
-                            turn = commands.turn_right_min
-                        else:
-                            turn = commands.turn_left_min
-
-                        # throttle to one turn every 1 second
-                        now = time.time()
-                        if now - last_turn_time >= 1.0:
-                            asyncio.run_coroutine_threadsafe(turn(conn), loop)
-                            last_turn_time = now
-                else:
-                    print(f"[INFO] No “{target}” detected this frame.")
-
-            cv2.imshow(win_name, annotated)
-            if cv2.waitKey(1) == ord('q'):
-                running = False
-        else:
+        if frame_queue.empty():
             time.sleep(0.01)
+            continue
+
+        frame   = frame_queue.get()
+        results = model(frame, verbose=False)[0]
+        annotated = results.plot()
+        img_h, img_w = frame.shape[:2]
+
+        if centering and target:
+            names      = results.names
+            boxes      = results.boxes
+            candidates = []
+
+            for box, cls_id in zip(boxes.xyxy, boxes.cls):
+                name = names[int(cls_id)].lower().replace(' ', '')
+                if name == target:
+                    x1, y1, x2, y2 = box
+                    area = float((x2 - x1) * (y2 - y1))
+                    cx   = float((x1 + x2) / 2)
+                    candidates.append((area, cx))
+
+            if candidates:
+                # compute offset
+                _, cx = max(candidates, key=lambda x: x[0])
+                dx    = cx - img_w / 2
+                tol   = 0.05 * img_w
+
+                # --- Turning logic ---
+                if abs(dx) > tol and (time.time() - last_turn_time) >= 1.5:
+                    turn = commands.turn_right_min if dx > 0 else commands.turn_left_min
+                    asyncio.run_coroutine_threadsafe(turn(conn), loop)
+                    last_turn_time = time.time()
+
+                # --- Approaching logic ---
+                if approaching and abs(dx) <= tol:
+                    # pick largest box area
+                    area, _ = max(candidates, key=lambda x: x[0])
+                    min_area = 0.40 * img_w * img_h  # object must cover 40% of frame before we stop
+                    if area < min_area and (time.time() - last_forward_time) >= 1.0:
+                        asyncio.run_coroutine_threadsafe(move_forward(conn), loop)
+                        last_forward_time = time.time()
+                    elif area >= min_area:
+                        print("[INFO] Close enough to the target.")
+            else:
+                print(f"[INFO] No “{target}” detected this frame.")
+
+        cv2.imshow(win_name, annotated)
+        if cv2.waitKey(1) == ord('q'):
+            running = False
 
     # 4) Cleanup
     cv2.destroyAllWindows()
