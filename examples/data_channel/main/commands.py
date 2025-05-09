@@ -76,7 +76,7 @@ async def turn_left_min(conn):
         RTC_TOPIC["SPORT_MOD"],
         {
             "api_id": SPORT_CMD["Move"],
-            "parameter": {"x": 0, "y": 0, "z": 1} 
+            "parameter": {"x": 0, "y": 0, "z": 0.5} 
         }
     )
 
@@ -107,6 +107,6 @@ async def turn_right_min(conn):
         RTC_TOPIC["SPORT_MOD"],
         {
             "api_id": SPORT_CMD["Move"],
-            "parameter": {"x": 0, "y": 0, "z": -1} 
+            "parameter": {"x": 0, "y": 0, "z": -0.5} 
         }
     )

@@ -1,12 +1,9 @@
 import os
 import sys
 import cv2
-import numpy as np
 import asyncio
 import logging
-import threading
 import time
-from queue import Queue, Empty
 
 import torch
 from ultralytics import YOLO
@@ -23,215 +20,166 @@ from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectio
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
 from aiortc import MediaStreamTrack
 
-logging.basicConfig(level=logging.FATAL)
+# silence h264 decode errors from aiortc
+logging.getLogger('aiortc.codecs.h264').setLevel(logging.ERROR)
+# logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# — Pick device dynamically —
+# device & model
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-print(f"[INFO] Using device: {device}")
-
-# — Load model on appropriate device, half-precision only on GPU —
+logger.info(f"Using device: {device}")
 model = YOLO('yolov8n.pt').to(device)
 if device.startswith('cuda'):
     model = model.half()
 
-# configuration constants
-TURN_DELAY = 1                 # seconds between any turn commands
-SPIN_THRESHOLD_FRAMES = 3      # require this many consecutive misses before spinning
-CENTER_TOL = 0.1               # tolerance as fraction of small_w
-HYST_FRACTION = 0.02           # hysteresis band as fraction of small_w
-MIN_CONFIDENCE = 0.5           # minimum YOLO confidence
-MIN_AREA_FRAC = 0.02           # minimum box area fraction (small frame) for detection
-APPROACH_AREA_FRAC = 0.40      # box area fraction (small frame) to consider “close enough”
+# control params
+TURN_DELAY = 1.0           # seconds between turn/move commands
+EMA_ALPHA = 0.3            # smoothing factor for dx
+AREA_ALPHA = 0.2           # smoothing for area
+CONF_THRESH = 0.3          # detection confidence threshold
+DETECT_AREA_RATIO = 0.02   # ignore boxes smaller than 2% of frame area
 
-async def move_forward(conn):
-    await conn.datachannel.pub_sub.publish_request_new(
-        RTC_TOPIC["SPORT_MOD"],
-        {
-            "api_id": SPORT_CMD["Move"],
-            "parameter": {"x": 1, "y": 0, "z": 0}
-        }
-    )
+MIN_AREA_RATIO = 0.2       # stop approaching when object covers 20% of frame
+SPIN_THRESHOLD = 5         # consecutive misses before spin
+RESIZE_W, RESIZE_H = 640, 360
+APPROACH_SPEED = 0.3       # forward speed (0-1)
 
-def main():
-    frame_queue  = Queue()
-    target       = None
-    centering    = False
-    approaching  = False
-    running      = True
+async def recv_camera_stream(track: MediaStreamTrack, queue: asyncio.Queue):
+    while True:
+        frame = await track.recv()
+        img = frame.to_ndarray(format='bgr24')
+        if not queue.empty():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        await queue.put(img)
 
-    # state for throttles & debouncing
-    last_turn_time           = 0.0
-    last_forward_time        = 0.0
-    last_no_detect_spin_time = 0.0
-    no_detect_frames         = 0
-
-    # 1) WebRTC + asyncio setup
-    conn = Go2WebRTCConnection(WebRTCConnectionMethod.LocalAP)
-    loop = asyncio.new_event_loop()
-
-    async def recv_camera_stream(track: MediaStreamTrack):
-        while True:
-            frame = await track.recv()
-            img = frame.to_ndarray(format="bgr24")
-            frame_queue.put(img)
-
-    def rtc_thread(loop):
-        asyncio.set_event_loop(loop)
-        async def setup():
-            await conn.connect()
-            conn.video.switchVideoChannel(True)
-            conn.video.add_track_callback(recv_camera_stream)
-        loop.run_until_complete(setup())
-        loop.run_forever()
-
-    threading.Thread(target=rtc_thread, args=(loop,), daemon=True).start()
-
-    # 2) Input thread for commands
-    def input_thread():
-        nonlocal target, centering, approaching, running
-        while running:
-            cmd = input('> ').strip().lower()
-            if cmd.startswith('target '):
-                raw = cmd.split(' ', 1)[1]
-                target = raw.replace(' ', '').lower()
-                print(f"[INFO] Target set to “{raw}”")
-            elif cmd == 'start':
-                if target:
-                    centering = True
-                    print("[INFO] Auto-centering ON")
-                else:
-                    print("[WARN] You must set a target first: target <object_name>")
-            elif cmd == 'approach':
-                approaching = not approaching
-                print(f"[INFO] Auto-approach {'ON' if approaching else 'OFF'}")
-            elif cmd == 'stop':
-                centering = False
-                approaching = False
-                print("[INFO] Auto-centering & Auto-approach OFF")
-            elif cmd == 'quit':
-                running = False
-                print("[INFO] Quitting...")
+async def input_loop(state):
+    loop = asyncio.get_event_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            continue
+        cmd = line.strip().lower()
+        if cmd.startswith('target '):
+            raw = cmd.split(' ',1)[1]
+            state['target'] = raw.replace(' ','').lower()
+            logger.info(f"Target set to '{raw}'")
+        elif cmd == 'start':
+            if state['target']:
+                state.update({'centering': True, 'state': 'CENTER', 'missed_count': 0})
+                logger.info("Auto-centering ON")
             else:
-                print(f"[WARN] Unknown command: {cmd}")
+                logger.warning("Set a target first: target <object_name>")
+        elif cmd == 'approach':
+            state['approaching'] = not state['approaching']
+            state['state'] = 'APPROACH' if state['approaching'] else 'CENTER'
+            logger.info(f"Auto-approach {'ON' if state['approaching'] else 'OFF'}")
+        elif cmd == 'stop':
+            state.update({'centering': False, 'approaching': False, 'state': 'IDLE'})
+            logger.info("Auto-centering & approach OFF")
+        elif cmd == 'quit':
+            state['running'] = False
+            logger.info("Quitting...")
+            return
+        else:
+            logger.warning(f"Unknown command: {cmd}")
 
-    threading.Thread(target=input_thread, daemon=True).start()
-
+async def detection_loop(conn, queue, state):
+    last_turn = last_forward = last_spin = 0.0
+    ema_dx = ema_area = 0.0
     win_name = 'Object Detection'
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 
-    # detection loop
-    while running:
-        # — Always work on the freshest frame —
+    while state['running']:
         try:
-            frame = frame_queue.get(timeout=0.1)
-        except Empty:
+            frame = await asyncio.wait_for(queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
             continue
-        while True:
-            try:
-                frame = frame_queue.get_nowait()
-            except Empty:
-                break
-
-        img_h, img_w = frame.shape[:2]
-
-        # — Speed-up: resize for faster inference —
-        small_w, small_h = 320, 180
-        small = cv2.resize(frame, (small_w, small_h))
-
-        # run detection on the small frame
+        h, w = frame.shape[:2]
+        small = cv2.resize(frame, (RESIZE_W, RESIZE_H))
         results = model(small, verbose=False)[0]
 
-        # annotate on full-size frame
         annotated = frame.copy()
         for box, cls in zip(results.boxes.xyxy, results.boxes.cls):
-            x1, y1, x2, y2 = box
-            # scale coords back up
-            x1 = int(x1 * img_w / small_w)
-            y1 = int(y1 * img_h / small_h)
-            x2 = int(x2 * img_w / small_w)
-            y2 = int(y2 * img_h / small_h)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0,255,0), 2)
+            x1,y1,x2,y2 = box
+            x1,y1,x2,y2 = map(int, [x1*w/RESIZE_W, y1*h/RESIZE_H, x2*w/RESIZE_W, y2*h/RESIZE_H])
+            cv2.rectangle(annotated, (x1,y1),(x2,y2),(0,255,0),2)
             name = results.names[int(cls)]
-            cv2.putText(
-                annotated, name, (x1, y1-5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1
-            )
+            cv2.putText(annotated, name, (x1,y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
 
-        # centering, approach & spin logic
-        if centering and target:
-            names      = results.names
-            boxes      = results.boxes
+        if state['state'] in ('CENTER','APPROACH') and state['target']:
             candidates = []
-
-            # build filtered candidate list in small-frame coords
-            area_threshold      = MIN_AREA_FRAC * (small_w * small_h)
-            approach_area_thresh= APPROACH_AREA_FRAC * (small_w * small_h)
-            for box, cls_id, conf in zip(boxes.xyxy, boxes.cls, results.boxes.conf):
-                if float(conf) < MIN_CONFIDENCE:
+            for box, cls_id, conf in zip(results.boxes.xyxy, results.boxes.cls, results.boxes.conf):
+                if conf < CONF_THRESH:
                     continue
-                x1, y1, x2, y2 = box
-                area = float((x2 - x1) * (y2 - y1))
-                if area < area_threshold:
+                x1,y1,x2,y2 = box
+                area = (x2-x1)*(y2-y1)
+                # ignore tiny detections
+                if area < DETECT_AREA_RATIO * w * h:
                     continue
-                name = names[int(cls_id)].lower().replace(' ', '')
-                if name == target:
-                    cx = float((x1 + x2) / 2)
+                name = results.names[int(cls_id)].lower().replace(' ','')
+                if name == state['target']:
+                    cx = (x1+x2)/2
                     candidates.append((area, cx))
 
             if candidates:
                 # reset miss counter
-                no_detect_frames = 0
+                state['missed_count'] = 0
+                area, cx = max(candidates, key=lambda x: x[0])
+                dx = cx - RESIZE_W/2
+                ema_dx = EMA_ALPHA * dx + (1-EMA_ALPHA) * ema_dx
+                norm_area = area / (w*h)
+                ema_area = AREA_ALPHA * norm_area + (1-AREA_ALPHA) * ema_area
 
-                # pick largest
-                _, cx = max(candidates, key=lambda x: x[0])
-                dx    = cx - (small_w / 2)
+                # turning to center
+                if abs(ema_dx) > 0.1*RESIZE_W and time.time() - last_turn >= TURN_DELAY:
+                    if ema_dx > 0:
+                        await commands.turn_right_min(conn)
+                    else:
+                        await commands.turn_left_min(conn)
+                    last_turn = time.time()
 
-                tol       = CENTER_TOL * small_w
-                hysteresis= HYST_FRACTION * small_w
-
-                # turning with hysteresis + delay
-                now = time.time()
-                if now - last_turn_time >= TURN_DELAY:
-                    if dx > tol + hysteresis:
-                        asyncio.run_coroutine_threadsafe(
-                            commands.turn_right_min(conn), loop
-                        )
-                        last_turn_time = now
-                    elif dx < -tol - hysteresis:
-                        asyncio.run_coroutine_threadsafe(
-                            commands.turn_left_min(conn), loop
-                        )
-                        last_turn_time = now
-
-                # approaching when centered
-                if approaching and abs(dx) <= tol:
-                    # reuse area from before
-                    area, _ = max(candidates, key=lambda x: x[0])
-                    if area < approach_area_thresh and (now - last_forward_time) >= 1.0:
-                        asyncio.run_coroutine_threadsafe(move_forward(conn), loop)
-                        last_forward_time = now
-                    elif area >= approach_area_thresh:
-                        print("[INFO] Close enough to the target.")
-
+                # controlled approach
+                if state['state'] == 'APPROACH' and abs(ema_dx) <= 0.1*RESIZE_W:
+                    if ema_area < MIN_AREA_RATIO:
+                        if time.time() - last_forward >= TURN_DELAY:
+                            await conn.datachannel.pub_sub.publish_request_new(
+                                RTC_TOPIC['SPORT_MOD'],
+                                {'api_id': SPORT_CMD['Move'], 'parameter':{'x':APPROACH_SPEED,'y':0,'z':0}}
+                            )
+                            last_forward = time.time()
+                    else:
+                        logger.info("Reached stopping distance.")
             else:
-                # count consecutive misses
-                no_detect_frames += 1
-                now = time.time()
-                if (no_detect_frames >= SPIN_THRESHOLD_FRAMES and
-                    now - last_no_detect_spin_time >= TURN_DELAY):
-                    asyncio.run_coroutine_threadsafe(
-                        commands.turn_left_min(conn), loop
-                    )
-                    last_no_detect_spin_time = now
-                print(f"[INFO] No “{target}” detected — spinning to search...")
+                # increment miss counter and spin when needed
+                state['missed_count'] += 1
+                if state['missed_count'] >= SPIN_THRESHOLD and time.time() - last_spin >= TURN_DELAY:
+                    await commands.turn_right_min(conn)
+                    last_spin = time.time()
+                    state['missed_count'] = 0
+                logger.info(f"No '{state['target']}' detected ({state['missed_count']}/{SPIN_THRESHOLD})")
 
         cv2.imshow(win_name, annotated)
         if cv2.waitKey(1) == ord('q'):
-            running = False
+            state['running'] = False
+            break
 
-    # cleanup
     cv2.destroyAllWindows()
-    loop.call_soon_threadsafe(loop.stop)
+
+async def main():
+    state = {'target':None, 'centering':False, 'approaching':False, 'state':'IDLE', 'running':True, 'missed_count':0}
+
+    conn = Go2WebRTCConnection(WebRTCConnectionMethod.LocalAP)
+    await conn.connect()
+    conn.video.switchVideoChannel(True)
+
+    frame_queue = asyncio.Queue(maxsize=1)
+    conn.video.add_track_callback(lambda track: asyncio.create_task(recv_camera_stream(track, frame_queue)))
+
+    await asyncio.gather(input_loop(state), detection_loop(conn, frame_queue, state))
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
