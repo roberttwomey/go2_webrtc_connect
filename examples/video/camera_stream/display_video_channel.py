@@ -20,6 +20,13 @@ from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectio
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
 from aiortc import MediaStreamTrack
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'YOLO-3D')))
+from detection_model import ObjectDetector
+from depth_model import DepthEstimator
+
+detector = ObjectDetector(model_path='path/to/yolo3d_model.pth', conf_thresh=0.5)
+depth_estimator = DepthEstimator(model_name='depth-anything')
+
 # silence h264 decode errors from aiortc
 logging.getLogger('aiortc.codecs.h264').setLevel(logging.ERROR)
 # logging setup
@@ -101,6 +108,16 @@ async def detection_loop(conn, queue, state):
         h, w = frame.shape[:2]
         small = cv2.resize(frame, (RESIZE_W, RESIZE_H))
         results = model(small, verbose=False)[0]
+
+        yolo3d_detections = detector.detect(frame)
+        depth_map = depth_estimator.estimate(frame)
+
+        for detection in yolo3d_detections:
+            bbox = detection['bbox']  # [x1, y1, x2, y2]
+            center_x = int((bbox[0] + bbox[2]) / 2)
+            center_y = int((bbox[1] + bbox[3]) / 2)
+            distance = depth_map[center_y, center_x]
+            logger.info(f"YOLO-3D detected object at ({center_x},{center_y}), distance: {distance:.2f} m")
 
         annotated = frame.copy()
         for box, cls in zip(results.boxes.xyxy, results.boxes.cls):
