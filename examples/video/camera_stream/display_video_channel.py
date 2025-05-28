@@ -25,7 +25,7 @@ from detection_model import ObjectDetector
 from depth_model import DepthEstimator
 
 detector = ObjectDetector(model_path='path/to/yolo3d_model.pth', conf_thresh=0.5)
-depth_estimator = DepthEstimator(model_name='depth-anything')
+depth_estimator = DepthEstimator(model_size='small')
 
 # silence h264 decode errors from aiortc
 logging.getLogger('aiortc.codecs.h264').setLevel(logging.ERROR)
@@ -110,7 +110,13 @@ async def detection_loop(conn, queue, state):
         results = model(small, verbose=False)[0]
 
         yolo3d_detections = detector.detect(frame)
-        depth_map = depth_estimator.estimate(frame)
+        depth_map = depth_estimator.estimate_depth(frame)
+
+        # colorize & resize
+        colored_depth = depth_estimator.colorize_depth(depth_map)
+        depth_overlay = cv2.resize(colored_depth, (w, h))
+        # blend with the original
+        blended = cv2.addWeighted(frame, 0.6, depth_overlay, 0.4, 0)
 
         for detection in yolo3d_detections:
             bbox = detection['bbox']  # [x1, y1, x2, y2]
@@ -179,6 +185,7 @@ async def detection_loop(conn, queue, state):
                     state['missed_count'] = 0
                 logger.info(f"No '{state['target']}' detected ({state['missed_count']}/{SPIN_THRESHOLD})")
 
+        cv2.imshow("Depth Overlay", blended)
         cv2.imshow(win_name, annotated)
         if cv2.waitKey(1) == ord('q'):
             state['running'] = False
