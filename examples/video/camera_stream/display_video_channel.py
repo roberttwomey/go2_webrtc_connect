@@ -20,11 +20,11 @@ from go2_webrtc_driver.webrtc_driver import Go2WebRTCConnection, WebRTCConnectio
 from go2_webrtc_driver.constants import RTC_TOPIC, SPORT_CMD
 from aiortc import MediaStreamTrack
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'YOLO-3D')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'YOLO-3D')))
 from detection_model import ObjectDetector
 from depth_model import DepthEstimator
 
-detector = ObjectDetector(model_path='path/to/yolo3d_model.pth', conf_thresh=0.5)
+detector = ObjectDetector(model_size='small', conf_thres=0.5)
 depth_estimator = DepthEstimator(model_size='small')
 
 # silence h264 decode errors from aiortc
