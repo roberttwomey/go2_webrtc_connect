@@ -97,7 +97,8 @@ class Go2WebRTCConnection:
         configuration = self.create_webrtc_configuration(turn_server_info)
         self.pc = RTCPeerConnection(configuration)
 
-
+        # self.pc.addTransceiver("video", direction="recvonly")
+        
         self.datachannel = WebRTCDataChannel(self, self.pc)
 
         self.audio = WebRTCAudioChannel(self.pc, self.datachannel)
@@ -176,9 +177,9 @@ class Go2WebRTCConnection:
                 from aiortc.codecs import get_capabilities
                 capabilities = get_capabilities("video")
                 for codec in capabilities.codecs:
-                    if codec.mimeType.lower() == "video/vp8":
+                    if codec.mimeType.lower() == "video/h264":
                         transceiver.setCodecPreferences([codec])
-                        print("[INFO] VP8 codec forced for video stream")
+                        print("[INFO] H264 codec forced for video stream")
                         
         await self.pc.setLocalDescription(offer)
 
