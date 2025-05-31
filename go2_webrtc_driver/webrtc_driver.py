@@ -188,6 +188,8 @@ class Go2WebRTCConnection:
         elif self.connectionMethod == WebRTCConnectionMethod.LocalSTA or self.connectionMethod == WebRTCConnectionMethod.LocalAP:
             peer_answer_json = await self.get_answer_from_local_peer(self.pc, self.ip)
 
+        print(json.dumps(peer_answer_json, indent=2))  
+
         if peer_answer_json is not None:
             peer_answer = json.loads(peer_answer_json)
         else:
